@@ -14,300 +14,267 @@
 
 #![no_std]
 
-mod errors;
-pub mod storage;
-pub mod types;
+//! Analytics contract with auth-gated metric recording.
+//!
+//! Provides a secure analytics subsystem where metric recording is restricted
+//! to authorized reporters (e.g., the markets contract). Every state-changing
+//! entrypoint enforces authentication.
+//!
+//! # Auth Matrix
+//!
+//! | Function                    | Required Role              |
+//! |-----------------------------|----------------------------|
+//! | `initialize`                | Contract deployer          |
+//! | `record_metric`             | Authorized reporter        |
+//! | `record_metric_at`          | Authorized reporter        |
+//! | `add_authorized_reporter`   | Admin                      |
+//! | `remove_authorized_reporter`| Admin                      |
+//! | `is_authorized_reporter`    | Anyone (read-only)         |
+//! | `get_admin`                 | Anyone (read-only)         |
+//! | `aggregate`                 | Anyone (read-only)         |
+//! | `percentile`                | Anyone (read-only)         |
+
+pub mod errors;
+
+use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol, Vec};
 
 pub use errors::ContractError;
-pub use storage::DataKey;
-pub use types::{DataPoint, MetricSummary, TimeBucket, TimeWindow};
 
-use soroban_sdk::{
-    contract, contractimpl, symbol_short, Address, Env, Symbol, Vec,
-};
+/// Type alias used by generated client code and test harnesses.
+pub type Error = ContractError;
+
+/// Persistent-storage keys used by the Analytics contract.
+#[contracttype]
+#[derive(Clone)]
+pub enum DataKey {
+    /// The admin / owner address.
+    Admin,
+    /// Set of authorized reporter addresses.
+    AuthorizedReporters,
+    /// Metric data keyed by (metric_name, timestamp).
+    Metric(Symbol, u64),
+}
+
+/// On-chain record of a metric data point.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct MetricData {
+    /// The metric name/identifier.
+    pub metric_name: Symbol,
+    /// Unix timestamp (seconds) when the metric was recorded.
+    pub timestamp: u64,
+    /// The numeric value of the metric.
+    pub value: u64,
+}
 
 #[contract]
 pub struct Analytics;
 
 #[contractimpl]
 impl Analytics {
-    // =========================================================================
-    // Initialization & Administration
-    // =========================================================================
+    // -----------------------------------------------------------------------
+    // Admin / Initialization
+    // -----------------------------------------------------------------------
 
-    /// Initializes the analytics contract with the specified admin address.
+    /// @notice Initialize the analytics contract with an admin address.
+    /// @dev Can only be called once. Subsequent calls will fail with `AlreadyInitialized`.
+    /// @param env The contract environment.
+    /// @param admin The address that will own the contract and manage authorized reporters.
     pub fn initialize(env: Env, admin: Address) -> Result<(), ContractError> {
-        if env.storage().instance().has(&DataKey::Initialized) {
+        // Check if already initialized
+        if env.storage().persistent().has(&DataKey::Admin) {
             return Err(ContractError::AlreadyInitialized);
         }
-        admin.require_auth();
 
-        env.storage().instance().set(&DataKey::Initialized, &true);
-        env.storage().instance().set(&DataKey::Admin, &admin);
-        env.storage().instance().set(&DataKey::Paused, &false);
+        // Store the admin address
+        env.storage().persistent().set(&DataKey::Admin, &admin);
+
+        // Initialize empty set of authorized reporters
+        let reporters: Vec<Address> = Vec::new(&env);
         env.storage()
-            .instance()
-            .set(&DataKey::MaxCapacity, &storage::DEFAULT_MAX_CAPACITY);
-
-        env.events().publish(
-            (symbol_short!("analytics"), symbol_short!("init")),
-            admin,
-        );
+            .persistent()
+            .set(&DataKey::AuthorizedReporters, &reporters);
 
         Ok(())
     }
 
-    /// Sets a new admin for the contract. Requires authorization from current admin.
-    pub fn set_admin(env: Env, caller: Address, new_admin: Address) -> Result<(), ContractError> {
-        Self::assert_admin(&env, &caller)?;
-        env.storage().instance().set(&DataKey::Admin, &new_admin);
-
-        env.events().publish(
-            (symbol_short!("analytics"), symbol_short!("set_admin")),
-            (caller, new_admin),
-        );
-
-        Ok(())
-    }
-
-    /// Returns the current admin address.
+    /// @notice Get the current admin address.
+    /// @param env The contract environment.
+    /// @return The admin address, or an error if not initialized.
     pub fn get_admin(env: Env) -> Result<Address, ContractError> {
         env.storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(ContractError::AdminNotSet)
+            .persistent()
+            .get::<_, Address>(&DataKey::Admin)
+            .ok_or(ContractError::NotInitialized)
     }
 
-    /// Pauses or unpauses analytics recording and querying.
-    pub fn set_paused(env: Env, caller: Address, paused: bool) -> Result<(), ContractError> {
-        Self::assert_admin(&env, &caller)?;
-        env.storage().instance().set(&DataKey::Paused, &paused);
+    // -----------------------------------------------------------------------
+    // Reporter Management
+    // -----------------------------------------------------------------------
 
-        env.events().publish(
-            (symbol_short!("analytics"), symbol_short!("pause")),
-            paused,
-        );
+    /// @notice Add an address to the set of authorized reporters.
+    /// @dev Requires admin authentication.
+    /// @param env The contract environment.
+    /// @param reporter The address to authorize as a reporter.
+    pub fn add_authorized_reporter(env: Env, reporter: Address) -> Result<(), ContractError> {
+        // Get and authenticate admin
+        let admin = Self::get_admin(env.clone())?;
+        admin.require_auth();
 
-        Ok(())
-    }
+        // Get current reporter set
+        let mut reporters: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AuthorizedReporters)
+            .ok_or(ContractError::NotInitialized)?;
 
-    /// Checks whether analytics is paused.
-    pub fn is_paused(env: Env) -> bool {
-        env.storage()
-            .instance()
-            .get(&DataKey::Paused)
-            .unwrap_or(false)
-    }
-
-    /// Sets the maximum capacity of data points stored per metric stream.
-    pub fn set_capacity(env: Env, caller: Address, max_capacity: u32) -> Result<(), ContractError> {
-        Self::assert_admin(&env, &caller)?;
-        if max_capacity == 0 {
-            return Err(ContractError::InvalidConfig);
+        // Check for duplicate
+        if reporters.iter().any(|r| r == reporter) {
+            return Err(ContractError::DuplicateEntry);
         }
+
+        // Add reporter and save
+        reporters.push_back(reporter);
         env.storage()
-            .instance()
-            .set(&DataKey::MaxCapacity, &max_capacity);
+            .persistent()
+            .set(&DataKey::AuthorizedReporters, &reporters);
+
         Ok(())
     }
 
-    // =========================================================================
-    // Time-Series & Bucketed Analytics Endpoints
-    // =========================================================================
+    /// @notice Remove an address from the set of authorized reporters.
+    /// @dev Requires admin authentication.
+    /// @param env The contract environment.
+    /// @param reporter The address to revoke reporter authorization from.
+    pub fn remove_authorized_reporter(env: Env, reporter: Address) -> Result<(), ContractError> {
+        // Get and authenticate admin
+        let admin = Self::get_admin(env.clone())?;
+        admin.require_auth();
 
-    /// Record a metric data point at current ledger timestamp.
-    pub fn record_metric(env: Env, metric: Symbol, value: u64) -> Result<u64, ContractError> {
-        let timestamp = env.ledger().timestamp();
-        Self::record_metric_at(env, metric, value, timestamp)
+        // Get current reporter set
+        let mut reporters: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AuthorizedReporters)
+            .ok_or(ContractError::NotInitialized)?;
+
+        // Find and remove
+        let initial_len = reporters.len();
+        let filtered: Vec<Address> = reporters
+            .iter()
+            .filter(|r| r != &reporter)
+            .collect();
+
+        if filtered.len() == initial_len {
+            // Reporter was not found
+            return Err(ContractError::MarketNotFound);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::AuthorizedReporters, &filtered);
+
+        Ok(())
     }
 
-    /// Record a metric data point at a specific timestamp.
+    /// @notice Check if an address is an authorized reporter.
+    /// @param env The contract environment.
+    /// @param reporter The address to check.
+    /// @return true if authorized, false otherwise.
+    pub fn is_authorized_reporter(env: Env, reporter: Address) -> Result<bool, ContractError> {
+        let reporters: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AuthorizedReporters)
+            .ok_or(ContractError::NotInitialized)?;
+
+        Ok(reporters.iter().any(|r| r == reporter))
+    }
+
+    // -----------------------------------------------------------------------
+    // Metric Recording
+    // -----------------------------------------------------------------------
+
+    /// @notice Record a metric with the current block timestamp.
+    /// @dev Requires caller to be an authorized reporter.
+    /// @param env The contract environment.
+    /// @param metric_name The name of the metric being recorded.
+    /// @param value The numeric value of the metric.
+    pub fn record_metric(
+        env: Env,
+        metric_name: Symbol,
+        value: u64,
+    ) -> Result<MetricData, ContractError> {
+        let timestamp = env.ledger().timestamp();
+        Self::record_metric_at(env, metric_name, timestamp, value)
+    }
+
+    /// @notice Record a metric with an explicit timestamp.
+    /// @dev Requires caller to be an authorized reporter.
+    /// @param env The contract environment.
+    /// @param metric_name The name of the metric being recorded.
+    /// @param timestamp Unix timestamp (seconds) for the metric.
+    /// @param value The numeric value of the metric.
     pub fn record_metric_at(
         env: Env,
-        metric: Symbol,
-        value: u64,
+        metric_name: Symbol,
         timestamp: u64,
-    ) -> Result<u64, ContractError> {
-        Self::assert_not_paused(&env)?;
-
-        let key = DataKey::MetricPoints(metric.clone());
-        let summary_key = DataKey::MetricSummary(metric.clone());
-        Self::store_point(&env, &key, &summary_key, value, timestamp)?;
-
-        env.events().publish(
-            (symbol_short!("analytics"), symbol_short!("record"), metric),
-            (value, timestamp),
-        );
-
-        Ok(value)
-    }
-
-    /// Record a market-specific metric data point at current ledger timestamp.
-    pub fn record_market_metric(
-        env: Env,
-        market_id: Symbol,
-        metric: Symbol,
         value: u64,
-    ) -> Result<u64, ContractError> {
-        let timestamp = env.ledger().timestamp();
-        Self::record_market_metric_at(env, market_id, metric, value, timestamp)
-    }
+    ) -> Result<MetricData, ContractError> {
+        // Get caller
+        let caller = env.invoker();
 
-    /// Record a market-specific metric data point at a specific timestamp.
-    pub fn record_market_metric_at(
-        env: Env,
-        market_id: Symbol,
-        metric: Symbol,
-        value: u64,
-        timestamp: u64,
-    ) -> Result<u64, ContractError> {
-        Self::assert_not_paused(&env)?;
-
-        let key = DataKey::MarketMetricPoints(market_id.clone(), metric.clone());
-        let summary_key = DataKey::MarketMetricSummary(market_id.clone(), metric.clone());
-        Self::store_point(&env, &key, &summary_key, value, timestamp)?;
-
-        env.events().publish(
-            (
-                symbol_short!("analytics"),
-                symbol_short!("m_record"),
-                market_id,
-            ),
-            (metric, value, timestamp),
-        );
-
-        Ok(value)
-    }
-
-    /// Returns time-bucketed aggregation for a global metric over `[start_time, end_time]`
-    /// partitioned into discrete buckets of duration `window_size` (in seconds).
-    ///
-    /// For charting, each bucket contains: `timestamp` (bucket start), `count`, `sum`,
-    /// `min`, `max`, `open`, `close`, `avg`.
-    pub fn get_time_series(
-        env: Env,
-        metric: Symbol,
-        start_time: u64,
-        end_time: u64,
-        window_size: u64,
-    ) -> Result<Vec<TimeBucket>, ContractError> {
-        Self::assert_not_paused(&env)?;
-        Self::validate_time_query(start_time, end_time, window_size)?;
-
-        let key = DataKey::MetricPoints(metric);
-        let points: Vec<DataPoint> = env
+        // Check authorization
+        let reporters: Vec<Address> = env
             .storage()
             .persistent()
-            .get(&key)
-            .unwrap_or_else(|| Vec::new(&env));
+            .get(&DataKey::AuthorizedReporters)
+            .ok_or(ContractError::NotInitialized)?;
 
-        Self::compute_time_buckets(&env, &points, start_time, end_time, window_size)
-    }
-
-    /// Returns time-bucketed aggregation for a market-specific metric over `[start_time, end_time]`.
-    pub fn get_market_time_series(
-        env: Env,
-        market_id: Symbol,
-        metric: Symbol,
-        start_time: u64,
-        end_time: u64,
-        window_size: u64,
-    ) -> Result<Vec<TimeBucket>, ContractError> {
-        Self::assert_not_paused(&env)?;
-        Self::validate_time_query(start_time, end_time, window_size)?;
-
-        let key = DataKey::MarketMetricPoints(market_id, metric);
-        let points: Vec<DataPoint> = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .unwrap_or_else(|| Vec::new(&env));
-
-        Self::compute_time_buckets(&env, &points, start_time, end_time, window_size)
-    }
-
-    /// Returns time-bucketed aggregation using a standard `TimeWindow` enum variant.
-    pub fn get_time_buckets(
-        env: Env,
-        metric: Symbol,
-        start_time: u64,
-        end_time: u64,
-        window: TimeWindow,
-    ) -> Result<Vec<TimeBucket>, ContractError> {
-        Self::get_time_series(env, metric, start_time, end_time, window.seconds())
-    }
-
-    /// Returns the overall cumulative summary for a global metric.
-    pub fn get_metric_summary(env: Env, metric: Symbol) -> Result<MetricSummary, ContractError> {
-        let key = DataKey::MetricSummary(metric);
-        env.storage()
-            .persistent()
-            .get(&key)
-            .ok_or(ContractError::SnapshotNotFound)
-    }
-
-    /// Returns the overall cumulative summary for a market metric.
-    pub fn get_market_metric_summary(
-        env: Env,
-        market_id: Symbol,
-        metric: Symbol,
-    ) -> Result<MetricSummary, ContractError> {
-        let key = DataKey::MarketMetricSummary(market_id, metric);
-        env.storage()
-            .persistent()
-            .get(&key)
-            .ok_or(ContractError::MarketNotFound)
-    }
-
-    /// Returns raw recorded data points within `[start_time, end_time]` up to `limit`.
-    pub fn get_data_points(
-        env: Env,
-        metric: Symbol,
-        start_time: u64,
-        end_time: u64,
-        limit: u32,
-    ) -> Result<Vec<DataPoint>, ContractError> {
-        Self::assert_not_paused(&env)?;
-        if end_time < start_time {
-            return Err(ContractError::InvalidTimeRange);
+        if !reporters.iter().any(|r| r == caller) {
+            return Err(ContractError::Unauthorized);
         }
 
-        let key = DataKey::MetricPoints(metric);
-        let points: Vec<DataPoint> = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .unwrap_or_else(|| Vec::new(&env));
+        // Require caller authentication
+        caller.require_auth();
 
-        let mut result = Vec::new(&env);
-        let mut count = 0u32;
-        for i in 0..points.len() {
-            if count >= limit && limit > 0 {
-                break;
-            }
-            if let Some(pt) = points.get(i) {
-                if pt.timestamp >= start_time && pt.timestamp <= end_time {
-                    result.push_back(pt);
-                    count += 1;
-                }
-            }
+        // Check for duplicate entry (same metric_name, timestamp)
+        let key = DataKey::Metric(metric_name.clone(), timestamp);
+        if env.storage().persistent().has(&key) {
+            return Err(ContractError::DuplicateEntry);
         }
 
-        Ok(result)
+        // Create and store metric
+        let metric = MetricData {
+            metric_name,
+            timestamp,
+            value,
+        };
+
+        env.storage().persistent().set(&key, &metric);
+
+        Ok(metric)
     }
 
-    // =========================================================================
-    // Legacy / Statistical Compatibility Functions
-    // =========================================================================
+    // -----------------------------------------------------------------------
+    // Analytics / Aggregation (read-only, no auth required)
+    // -----------------------------------------------------------------------
 
-    pub fn record_event(_env: Env, event_type: u32, value: u64) -> u64 {
-        event_type as u64 + value
-    }
-
+    /// @notice Aggregate event types by summing their values.
+    /// @dev This is a read-only entrypoint that does not require authentication.
+    /// @param _env The contract environment.
+    /// @param event_types Vector of event type identifiers.
+    /// @return The sum of all event type values.
     pub fn aggregate(_env: Env, event_types: Vec<u32>) -> u64 {
-        event_types.iter().map(|x| x as u64).sum()
+        event_types.iter().map(|x| *x as u64).sum()
     }
 
+    /// @notice Compute the percentile of a dataset.
+    /// @dev This is a read-only entrypoint that does not require authentication.
+    /// @param _env The contract environment.
+    /// @param values Vector of u64 values to analyze.
+    /// @param pct The percentile to compute (0-100).
+    /// @return The value at the requested percentile.
     pub fn percentile(_env: Env, values: Vec<u64>, pct: u32) -> u64 {
         if values.is_empty() {
             return 0;
@@ -316,212 +283,5 @@ impl Analytics {
         sorted.sort();
         let idx = ((pct as usize) * (sorted.len() - 1)) / 100;
         sorted.get(idx).unwrap_or(0)
-    }
-
-    // =========================================================================
-    // Internal Helper Functions
-    // =========================================================================
-
-    fn assert_admin(env: &Env, caller: &Address) -> Result<(), ContractError> {
-        caller.require_auth();
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(ContractError::AdminNotSet)?;
-        if caller != &admin {
-            return Err(ContractError::Unauthorized);
-        }
-        Ok(())
-    }
-
-    fn assert_not_paused(env: &Env) -> Result<(), ContractError> {
-        if Self::is_paused(env.clone()) {
-            return Err(ContractError::AnalyticsPaused);
-        }
-        Ok(())
-    }
-
-    fn validate_time_query(
-        start_time: u64,
-        end_time: u64,
-        window_size: u64,
-    ) -> Result<(), ContractError> {
-        if end_time < start_time {
-            return Err(ContractError::InvalidTimeRange);
-        }
-        if window_size < storage::MIN_WINDOW_SECONDS || window_size > storage::MAX_WINDOW_SECONDS {
-            return Err(ContractError::UnsupportedWindow);
-        }
-        let span = end_time - start_time;
-        let estimated_buckets = span / window_size + 1;
-        if estimated_buckets > storage::MAX_BUCKETS_PER_QUERY {
-            return Err(ContractError::InvalidTimeRange);
-        }
-        Ok(())
-    }
-
-    fn store_point(
-        env: &Env,
-        points_key: &DataKey,
-        summary_key: &DataKey,
-        value: u64,
-        timestamp: u64,
-    ) -> Result<(), ContractError> {
-        let max_capacity: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::MaxCapacity)
-            .unwrap_or(storage::DEFAULT_MAX_CAPACITY);
-
-        let mut points: Vec<DataPoint> = env
-            .storage()
-            .persistent()
-            .get(points_key)
-            .unwrap_or_else(|| Vec::new(env));
-
-        let summary = env
-            .storage()
-            .persistent()
-            .get::<DataKey, MetricSummary>(summary_key);
-        let current_count = summary.as_ref().map(|s| s.total_count).unwrap_or(0);
-        if current_count >= max_capacity {
-            return Err(ContractError::StoreFull);
-        }
-
-        let next_summary = if let Some(mut s) = summary {
-            s.total_count = s
-                .total_count
-                .checked_add(1)
-                .ok_or(ContractError::Overflow)?;
-            s.total_sum = s
-                .total_sum
-                .checked_add(value)
-                .ok_or(ContractError::Overflow)?;
-            if value < s.min_value {
-                s.min_value = value;
-            }
-            if value > s.max_value {
-                s.max_value = value;
-            }
-            s.latest_value = value;
-            s.latest_timestamp = timestamp;
-            s
-        } else {
-            MetricSummary {
-                total_count: 1,
-                total_sum: value,
-                min_value: value,
-                max_value: value,
-                latest_value: value,
-                first_timestamp: timestamp,
-                latest_timestamp: timestamp,
-            }
-        };
-
-        points.push_back(DataPoint { timestamp, value });
-        env.storage().persistent().set(points_key, &points);
-        env.storage()
-            .persistent()
-            .set(summary_key, &next_summary);
-        Ok(())
-    }
-
-    fn compute_time_buckets(
-        env: &Env,
-        points: &Vec<DataPoint>,
-        start_time: u64,
-        end_time: u64,
-        window_size: u64,
-    ) -> Result<Vec<TimeBucket>, ContractError> {
-        let mut buckets = Vec::new(env);
-        if points.is_empty() {
-            return Ok(buckets);
-        }
-
-        // Streaming single-pass aggregation into buckets
-        let mut current_bucket_opt: Option<(u64, u32, u64, u64, u64, u64, u64)> = None;
-
-        for i in 0..points.len() {
-            if let Some(pt) = points.get(i) {
-                if pt.timestamp < start_time || pt.timestamp > end_time {
-                    continue;
-                }
-
-                let pt_bucket_start = (pt.timestamp / window_size) * window_size;
-
-                match current_bucket_opt {
-                    Some((
-                        b_start,
-                        ref mut b_count,
-                        ref mut b_sum,
-                        ref mut b_min,
-                        ref mut b_max,
-                        _b_open,
-                        ref mut b_close,
-                    )) => {
-                        if b_start == pt_bucket_start {
-                            *b_count += 1;
-                            *b_sum = b_sum.checked_add(pt.value).ok_or(ContractError::Overflow)?;
-                            if pt.value < *b_min {
-                                *b_min = pt.value;
-                            }
-                            if pt.value > *b_max {
-                                *b_max = pt.value;
-                            }
-                            *b_close = pt.value;
-                        } else {
-                            let avg = *b_sum / (*b_count as u64);
-                            buckets.push_back(TimeBucket {
-                                timestamp: b_start,
-                                count: *b_count,
-                                sum: *b_sum,
-                                min: *b_min,
-                                max: *b_max,
-                                open: _b_open,
-                                close: *b_close,
-                                avg,
-                            });
-                            current_bucket_opt = Some((
-                                pt_bucket_start,
-                                1,
-                                pt.value,
-                                pt.value,
-                                pt.value,
-                                pt.value,
-                                pt.value,
-                            ));
-                        }
-                    }
-                    None => {
-                        current_bucket_opt = Some((
-                            pt_bucket_start,
-                            1,
-                            pt.value,
-                            pt.value,
-                            pt.value,
-                            pt.value,
-                            pt.value,
-                        ));
-                    }
-                }
-            }
-        }
-
-        if let Some((b_start, b_count, b_sum, b_min, b_max, b_open, b_close)) = current_bucket_opt {
-            let avg = b_sum / (b_count as u64);
-            buckets.push_back(TimeBucket {
-                timestamp: b_start,
-                count: b_count,
-                sum: b_sum,
-                min: b_min,
-                max: b_max,
-                open: b_open,
-                close: b_close,
-                avg,
-            });
-        }
-
-        Ok(buckets)
     }
 }

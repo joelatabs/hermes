@@ -76,6 +76,7 @@ fn create_standard_market(te: &TestEnv, num_outcomes: u32) -> u32 {
         &(te.env.ledger().timestamp() + 86400),
         &String::from_str(&te.env, "OracleSource"),
         &outcome_tags,
+        &1i128,
     )
 }
 
@@ -463,6 +464,7 @@ fn test_tiered_payout_with_runner_up_credit() {
         &String::from_str(&te.env, "Oracle"),
         &tags,
         &tiered_curve,
+        &1i128,
     );
 
     // Wagers:
@@ -518,6 +520,7 @@ fn test_custom_weights_payout() {
         &String::from_str(&te.env, "Oracle"),
         &tags,
         &curve,
+        &1i128,
     );
 
     te.client.place_bet(&te.bettor1, &m_id, &0, &500);
@@ -551,6 +554,7 @@ fn test_invalid_payout_curves_rejected() {
         &String::from_str(&te.env, "S"),
         &tags,
         &bad_tiered,
+        &1i128,
     );
     assert_eq!(
         res.unwrap_err().unwrap(),
@@ -570,6 +574,7 @@ fn test_invalid_payout_curves_rejected() {
         &String::from_str(&te.env, "S"),
         &tags,
         &bad_custom,
+        &1i128,
     );
     assert_eq!(
         res2.unwrap_err().unwrap(),
@@ -598,6 +603,7 @@ fn test_custom_weights_exactly_10000_required() {
         &String::from_str(&te.env, "S"),
         &tags,
         &under_custom,
+        &1i128,
     );
     assert_eq!(
         res_under.unwrap_err().unwrap(),
@@ -617,6 +623,7 @@ fn test_custom_weights_exactly_10000_required() {
         &String::from_str(&te.env, "S"),
         &tags,
         &half_custom,
+        &1i128,
     );
     assert_eq!(
         res_half.unwrap_err().unwrap(),
@@ -636,6 +643,7 @@ fn test_custom_weights_exactly_10000_required() {
         &String::from_str(&te.env, "S"),
         &tags,
         &one_custom,
+        &1i128,
     );
     assert_eq!(
         res_one.unwrap_err().unwrap(),
@@ -655,6 +663,7 @@ fn test_custom_weights_exactly_10000_required() {
         &String::from_str(&te.env, "Oracle"),
         &tags,
         &exact_custom,
+        &1i128,
     );
     assert!(res_exact.is_ok(), "Weights summing to 10_000 should be accepted");
 }
@@ -752,4 +761,190 @@ fn test_withdrawal_exact_boundary_cases() {
     assert_eq!(dust_res.net_amount, 50);
     assert_eq!(dust_res.fee_deducted, 0);
     assert_eq!(te.client.get_user_balance(&te.bettor2), 0);
+}
+
+// ===========================================================================
+//  MIN BET VALIDATION TESTS
+// ===========================================================================
+
+#[test]
+fn test_create_market_rejects_zero_min_bet() {
+    let te = setup_test_env();
+
+    let mut outcome_tags = Vec::new(&te.env);
+    outcome_tags.push_back(String::from_str(&te.env, "Yes"));
+    outcome_tags.push_back(String::from_str(&te.env, "No"));
+
+    let res = te.client.try_create_market(
+        &te.creator,
+        &String::from_str(&te.env, "Will it happen?"),
+        &String::from_str(&te.env, "Desc"),
+        &(te.env.ledger().timestamp() + 86400),
+        &String::from_str(&te.env, "Oracle"),
+        &outcome_tags,
+        &0i128,
+    );
+    assert_eq!(
+        res.unwrap_err().unwrap(),
+        ContractError::InvalidConfig.into()
+    );
+}
+
+#[test]
+fn test_create_market_rejects_negative_min_bet() {
+    let te = setup_test_env();
+
+    let mut outcome_tags = Vec::new(&te.env);
+    outcome_tags.push_back(String::from_str(&te.env, "Yes"));
+    outcome_tags.push_back(String::from_str(&te.env, "No"));
+
+    let res = te.client.try_create_market(
+        &te.creator,
+        &String::from_str(&te.env, "Will it happen?"),
+        &String::from_str(&te.env, "Desc"),
+        &(te.env.ledger().timestamp() + 86400),
+        &String::from_str(&te.env, "Oracle"),
+        &outcome_tags,
+        &-1i128,
+    );
+    assert_eq!(
+        res.unwrap_err().unwrap(),
+        ContractError::InvalidConfig.into()
+    );
+}
+
+#[test]
+fn test_place_bet_rejects_dust_below_min_bet() {
+    let te = setup_test_env();
+
+    // Create a market with min_bet = 1_000 stroops
+    let mut outcome_tags = Vec::new(&te.env);
+    outcome_tags.push_back(String::from_str(&te.env, "Yes"));
+    outcome_tags.push_back(String::from_str(&te.env, "No"));
+
+    let market_id = te.client.create_market(
+        &te.creator,
+        &String::from_str(&te.env, "Dust protection test"),
+        &String::from_str(&te.env, "Desc"),
+        &(te.env.ledger().timestamp() + 86400),
+        &String::from_str(&te.env, "Oracle"),
+        &outcome_tags,
+        &1_000i128,
+    );
+
+    // 999 stroops is below the 1_000 min_bet — must be rejected
+    let res = te.client.try_place_bet(&te.bettor1, &market_id, &0, &999i128);
+    assert_eq!(
+        res.unwrap_err().unwrap(),
+        ContractError::StakeTooSmall.into()
+    );
+
+    // 1 stroop is also below min_bet — historically valid but now rejected
+    let res2 = te.client.try_place_bet(&te.bettor1, &market_id, &0, &1i128);
+    assert_eq!(
+        res2.unwrap_err().unwrap(),
+        ContractError::StakeTooSmall.into()
+    );
+}
+
+#[test]
+fn test_place_bet_accepts_amount_at_min_bet() {
+    let te = setup_test_env();
+
+    let mut outcome_tags = Vec::new(&te.env);
+    outcome_tags.push_back(String::from_str(&te.env, "Yes"));
+    outcome_tags.push_back(String::from_str(&te.env, "No"));
+
+    let market_id = te.client.create_market(
+        &te.creator,
+        &String::from_str(&te.env, "Exact min_bet test"),
+        &String::from_str(&te.env, "Desc"),
+        &(te.env.ledger().timestamp() + 86400),
+        &String::from_str(&te.env, "Oracle"),
+        &outcome_tags,
+        &1_000i128,
+    );
+
+    // Exactly 1_000 stroops must succeed
+    let res = te.client.try_place_bet(&te.bettor1, &market_id, &0, &1_000i128);
+    assert!(res.is_ok(), "Bet at exactly min_bet should be accepted");
+}
+
+#[test]
+fn test_place_bet_accepts_amount_above_min_bet() {
+    let te = setup_test_env();
+
+    let mut outcome_tags = Vec::new(&te.env);
+    outcome_tags.push_back(String::from_str(&te.env, "Yes"));
+    outcome_tags.push_back(String::from_str(&te.env, "No"));
+
+    let market_id = te.client.create_market(
+        &te.creator,
+        &String::from_str(&te.env, "Above min_bet test"),
+        &String::from_str(&te.env, "Desc"),
+        &(te.env.ledger().timestamp() + 86400),
+        &String::from_str(&te.env, "Oracle"),
+        &outcome_tags,
+        &1_000i128,
+    );
+
+    // Well above min_bet must succeed
+    let res = te.client.try_place_bet(&te.bettor1, &market_id, &0, &50_000i128);
+    assert!(res.is_ok(), "Bet above min_bet should be accepted");
+}
+
+#[test]
+fn test_place_bet_still_rejects_zero_even_with_min_bet_one() {
+    let te = setup_test_env();
+
+    let mut outcome_tags = Vec::new(&te.env);
+    outcome_tags.push_back(String::from_str(&te.env, "Yes"));
+    outcome_tags.push_back(String::from_str(&te.env, "No"));
+
+    // Market with the smallest valid min_bet (1 stroop)
+    let market_id = te.client.create_market(
+        &te.creator,
+        &String::from_str(&te.env, "Min bet = 1"),
+        &String::from_str(&te.env, "Desc"),
+        &(te.env.ledger().timestamp() + 86400),
+        &String::from_str(&te.env, "Oracle"),
+        &outcome_tags,
+        &1i128,
+    );
+
+    // Zero is always invalid
+    let res = te.client.try_place_bet(&te.bettor1, &market_id, &0, &0i128);
+    assert_eq!(
+        res.unwrap_err().unwrap(),
+        ContractError::StakeTooSmall.into()
+    );
+
+    // Negative is always invalid
+    let res_neg = te.client.try_place_bet(&te.bettor1, &market_id, &0, &-1i128);
+    assert_eq!(
+        res_neg.unwrap_err().unwrap(),
+        ContractError::StakeTooSmall.into()
+    );
+}
+
+#[test]
+fn test_get_market_exposes_min_bet() {
+    let te = setup_test_env();
+
+    let mut outcome_tags = Vec::new(&te.env);
+    outcome_tags.push_back(String::from_str(&te.env, "Yes"));
+    outcome_tags.push_back(String::from_str(&te.env, "No"));
+
+    let market_id = te.client.create_market(
+        &te.creator,
+        &String::from_str(&te.env, "Read min_bet test"),
+        &String::from_str(&te.env, "Desc"),
+        &(te.env.ledger().timestamp() + 86400),
+        &String::from_str(&te.env, "Oracle"),
+        &outcome_tags,
+        &5_000i128,
+    );
+
+    let market = te.client.get_market(&market_id).unwrap();
+    assert_eq!(market.min_bet, 5_000i128);
 }

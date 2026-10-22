@@ -88,6 +88,7 @@ fn bench_contract_create_market(c: &mut Criterion) {
                 &end_time,
                 &resolution_source,
                 &outcome_tags,
+                &black_box(1i128),
             ))
         })
     });
@@ -120,6 +121,7 @@ fn bench_contract_place_bet(c: &mut Criterion) {
         &end_time,
         &resolution_source,
         &outcome_tags,
+        &1i128,
     );
 
     c.bench_function("contract_place_bet", |b| {
@@ -158,6 +160,7 @@ fn bench_contract_resolve_market(c: &mut Criterion) {
                 &end_time,
                 &resolution_source,
                 &outcome_tags,
+                &1i128,
             );
             black_box(client.resolve_market(&creator, &market_id, &0u32))
         })

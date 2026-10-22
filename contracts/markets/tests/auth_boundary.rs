@@ -91,6 +91,7 @@ fn create_market_with_mock_auth(setup: &TestSetup<'_>) -> u32 {
                 end_time,
                 resolution_source.clone(),
                 outcome_tags.clone(),
+                1i128,
             )
                 .into_val(env),
             sub_invokes: &[],
@@ -104,6 +105,7 @@ fn create_market_with_mock_auth(setup: &TestSetup<'_>) -> u32 {
         &end_time,
         &resolution_source,
         &outcome_tags,
+        &1i128,
     )
 }
 
@@ -126,6 +128,7 @@ fn create_market_with_auth_check(setup: &TestSetup<'_>) -> u32 {
         &end_time,
         &resolution_source,
         &outcome_tags,
+        &1i128,
     )
 }
 
@@ -159,6 +162,7 @@ fn test_create_market_requires_auth() {
         &end_time,
         &resolution_source,
         &outcome_tags,
+        &1i128,
     );
     assert!(
         result.is_err(),
@@ -213,6 +217,7 @@ fn test_market_limit_blocks_both_creation_entrypoints() {
         &end_time,
         &resolution_source,
         &outcome_tags,
+        &1i128,
     );
     assert_eq!(
         regular_result.unwrap_err().unwrap(),
@@ -228,6 +233,7 @@ fn test_market_limit_blocks_both_creation_entrypoints() {
         &resolution_source,
         &outcome_tags,
         &curve,
+        &1i128,
     );
     assert_eq!(
         curve_result.unwrap_err().unwrap(),
@@ -280,6 +286,7 @@ fn test_create_market_requires_auth_market_creator() {
         &end_time,
         &resolution_source,
         &outcome_tags,
+        &1i128,
     );
     assert!(result.is_ok(), "Authorized market creator should succeed");
 }

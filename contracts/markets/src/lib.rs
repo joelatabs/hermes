@@ -153,6 +153,9 @@ pub struct MarketData {
     pub winning_outcome: u32,
     /// Whether the market has been cancelled.
     pub cancelled: bool,
+    /// Minimum bet amount in stroops. Any `place_bet` call with `amount < min_bet`
+    /// is rejected with `StakeTooSmall`. Must be >= 1.
+    pub min_bet: i128,
 }
 
 /// On-chain record of a user's bet on a market.
@@ -845,6 +848,7 @@ impl MarketsContract {
         end_time: u64,
         resolution_source: String,
         outcome_tags: Vec<String>,
+        min_bet: i128,
     ) -> u32 {
         Self::create_market_with_curve(
             env.clone(),
@@ -855,6 +859,7 @@ impl MarketsContract {
             resolution_source,
             outcome_tags,
             PayoutCurveConfig::winner_takes_all(&env),
+            min_bet,
         )
     }
 
@@ -868,10 +873,15 @@ impl MarketsContract {
         resolution_source: String,
         outcome_tags: Vec<String>,
         curve: PayoutCurveConfig,
+        min_bet: i128,
     ) -> u32 {
         creator.require_auth();
 
         if outcome_tags.len() < 2 {
+            panic_with_error!(env, ContractError::InvalidConfig);
+        }
+
+        if min_bet < 1 {
             panic_with_error!(env, ContractError::InvalidConfig);
         }
 
@@ -905,6 +915,7 @@ impl MarketsContract {
             resolved: false,
             winning_outcome: 0,
             cancelled: false,
+            min_bet,
         };
         env.storage()
             .persistent()
@@ -1001,7 +1012,7 @@ impl MarketsContract {
             panic_with_error!(env, ContractError::InvalidOutcome);
         }
 
-        if amount <= 0 {
+        if amount <= 0 || amount < market.min_bet {
             panic_with_error!(env, ContractError::StakeTooSmall);
         }
 
